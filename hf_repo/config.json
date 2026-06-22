@@ -1,0 +1,24 @@
+{
+  "model_type": "music2pose",
+  "architectures": ["Music2PoseTransformer"],
+  "task": "audio-to-pose-generation",
+  "checkpoint_epoch": 180,
+  "audio_dim": 82,
+  "pose_dim": 297,
+  "pose_landmarks": 33,
+  "pose_channels": 9,
+  "audio_sample_rate": 32000,
+  "pose_fps": 25,
+  "context_len": 60,
+  "d_model": 256,
+  "nhead": 8,
+  "num_layers": 6,
+  "dropout": 0.1,
+  "max_seq_len": 260,
+  "training_dataset": "AIST++ (camera c01)",
+  "author": {
+    "name": "Emma Genthon",
+    "email": "genthonemma@gmail.com",
+    "username": "Emma5099"
+  }
+}

@@ -1,0 +1,8 @@
+torch>=2.0
+numpy>=1.24
+librosa>=0.10
+soundfile>=0.12
+matplotlib>=3.7
+datasets>=2.14
+tqdm>=4.65
+huggingface_hub>=0.20
