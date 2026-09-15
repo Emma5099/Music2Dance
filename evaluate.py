@@ -35,16 +35,17 @@ import torch
 import torch.nn.functional as F
 import librosa
 import matplotlib
-matplotlib.use("Agg")   # headless rendering
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from datasets import load_from_disk
 from tqdm import tqdm
 
 from model import Music2PoseTransformer
+from pose_postprocess import ground_poses
 from train import (
     audio_to_features, DanceDataset, compute_norm_stats, CONTEXT_LEN,
-    balanced_score, TARGET_MOTION_RATIO, BASELINE_CKPT,
+    BASELINE_CKPT,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -70,10 +71,10 @@ SKELETON_EDGES = [
 # ── Quick training for dry run ────────────────────────────────────────────────
 
 def default_checkpoint() -> str:
-    """Project baseline (epoch 180), then legacy best-* checkpoints."""
+    """Project baseline (epoch 180), then best.pt / best_motion.pt."""
     if os.path.exists(BASELINE_CKPT):
         return BASELINE_CKPT
-    for name in ("best_balanced.pt", "best.pt", "best_motion.pt"):
+    for name in ("best.pt", "best_motion.pt"):
         path = os.path.join(CKPT_DIR, name)
         if os.path.exists(path):
             return path
@@ -202,7 +203,6 @@ def render_video(
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     T = poses_xyz.shape[0]
 
-    # Axis limits from data
     xmin, xmax = poses_xyz[:, :, 0].min() - 0.1, poses_xyz[:, :, 0].max() + 0.1
     ymin, ymax = poses_xyz[:, :, 1].min() - 0.1, poses_xyz[:, :, 1].max() + 0.1
 
@@ -213,8 +213,6 @@ def render_video(
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_title(title, color="white", fontsize=10)
-
-    artists = []
 
     def update(frame_idx):
         ax.cla()
@@ -227,8 +225,6 @@ def render_video(
         draw_skeleton(ax, poses_xyz[frame_idx])
 
     ani = animation.FuncAnimation(fig, update, frames=T, interval=1000 / fps)
-
-    # Save via ffmpeg writer
     writer = animation.FFMpegWriter(fps=fps, bitrate=1200)
     try:
         ani.save(out_path, writer=writer)
@@ -289,6 +285,8 @@ def evaluate(
     sample_idx: int = 0,
     primer: str = "none",
     primer_frames: int = 0,
+    character_mesh: str | None = None,
+    ground: bool = False,
 ):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -324,9 +322,7 @@ def evaluate(
 
     print(f"Checkpoint epoch: {ckpt['epoch']}")
     if "val_motion_ratio" in ckpt:
-        target = ckpt.get("target_motion_ratio", TARGET_MOTION_RATIO)
-        print(f"  Saved motion%: {100 * ckpt['val_motion_ratio']:.1f}  "
-              f"(balanced target: {100 * target:.0f}%)")
+        print(f"  Saved motion%: {100 * ckpt['val_motion_ratio']:.1f}")
 
     primer_poses_norm = None
     if primer_frames > 0:
@@ -363,8 +359,6 @@ def evaluate(
     speed_pred = motion_energy_xyz(pred_xyz)
     speed_gt   = motion_energy_xyz(pose_gt_xyz)
     motion_pct = 100.0 * speed_pred / (speed_gt + 1e-6)
-    val_proxy = mse   # inference MSE on this clip (proxy for reconstruction quality)
-    bal = balanced_score(val_proxy, speed_pred / (speed_gt + 1e-6))
     print(f"\nMotion energy (mean joint speed):")
     print(f"  Predicted  : {speed_pred:.4f}  ({motion_pct:.1f}% of GT)")
     print(f"  Ground truth: {speed_gt:.4f}")
@@ -383,7 +377,6 @@ def evaluate(
         f.write(f"motion_speed_predicted:   {speed_pred:.4f}\n")
         f.write(f"motion_speed_groundtruth: {speed_gt:.4f}\n")
         f.write(f"motion_pct_of_gt: {motion_pct:.1f}\n")
-        f.write(f"balanced_score: {bal:.4f}\n")
         f.write(f"beat_alignment_predicted:   {score_pred:.3f}\n")
         f.write(f"beat_alignment_groundtruth: {score_gt:.3f}\n")
         if primer_frames > 0 and primer_poses_norm is not None:
@@ -391,15 +384,36 @@ def evaluate(
 
     # ── Render videos ─────────────────────────────────────────────────────────
     print(f"\nRendering videos to {OUTPUT_DIR}/ ...")
-    render_video(pred_xyz,    audio_raw, os.path.join(OUTPUT_DIR, "predicted.mp4"),    title="Predicted")
-    render_video(pose_gt_xyz, audio_raw, os.path.join(OUTPUT_DIR, "groundtruth.mp4"), title="Ground Truth")
+    pred_render = ground_poses(pred_xyz) if ground else pred_xyz
+    gt_render   = ground_poses(pose_gt_xyz) if ground else pose_gt_xyz
+    if ground:
+        print("  Grounding: planted lowest foot on median floor plane")
+    pred_path = os.path.join(OUTPUT_DIR, "predicted_poses.npy")
+    np.save(pred_path, pred_render.astype(np.float32))
+    print(f"  Saved poses: {pred_path}")
+    render_video(pred_render, audio_raw, os.path.join(OUTPUT_DIR, "predicted.mp4"),    title="Predicted")
+    render_video(gt_render,   audio_raw, os.path.join(OUTPUT_DIR, "groundtruth.mp4"), title="Ground Truth")
+
+    if character_mesh:
+        char_out = os.path.join(OUTPUT_DIR, "predicted_character.mp4")
+        # Write a short wav for muxing this sample
+        wav_path = os.path.join(OUTPUT_DIR, "_eval_audio.wav")
+        import soundfile as sf
+        sf.write(wav_path, audio_raw, AUDIO_SR)
+        print(f"\nRendering character mesh → {char_out}")
+        subprocess.run([
+            sys.executable, "3Dmodel/animate_character.py",
+            "--poses", pred_path,
+            "--mesh", character_mesh,
+            "--audio", wav_path,
+            "--out", char_out,
+        ], check=False)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'─'*50}")
     print(f"RESULTS for dry run on '{sample['stem']}'")
     print(f"  MSE (xyz only)      : {mse:.4f}")
-    print(f"  Motion speed (pred) : {speed_pred:.4f}  ({motion_pct:.1f}% of GT, target ~{100*TARGET_MOTION_RATIO:.0f}%)")
-    print(f"  Balanced score      : {bal:.4f}  (lower = better fit to sweet spot)")
+    print(f"  Motion speed (pred) : {speed_pred:.4f}  ({motion_pct:.1f}% of GT)")
     print(f"  Beat score (pred)   : {score_pred:.3f}  (GT: {score_gt:.3f})")
     print(f"  Videos              : {OUTPUT_DIR}/predicted.mp4")
     print(f"                        {OUTPUT_DIR}/groundtruth.mp4")
@@ -425,6 +439,10 @@ def main():
                         help="Pose primer for first N frames (gt or mean in normalised space)")
     parser.add_argument("--primer_frames", type=int, default=0,
                         help="Number of primer frames (e.g. 50 = 2 s at 25 fps)")
+    parser.add_argument("--character_mesh", default=None,
+                        help="Optional GLB to skin onto predicted poses")
+    parser.add_argument("--ground", action="store_true",
+                        help="Plant lowest foot on a floor plane (post-process; prefer training fixes)")
     args = parser.parse_args()
 
     if args.dry_run and args.checkpoint is None:
@@ -442,6 +460,8 @@ def main():
         sample_idx=args.sample_idx,
         primer=args.primer,
         primer_frames=args.primer_frames,
+        character_mesh=args.character_mesh,
+        ground=args.ground,
     )
 
 

@@ -2,7 +2,7 @@
   "model_type": "music2pose",
   "architectures": ["Music2PoseTransformer"],
   "task": "audio-to-pose-generation",
-  "checkpoint_epoch": 180,
+  "checkpoint_epoch": 250,
   "audio_dim": 82,
   "pose_dim": 297,
   "pose_landmarks": 33,

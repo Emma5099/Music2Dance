@@ -16,6 +16,7 @@ import matplotlib.animation as animation
 from tqdm import tqdm
 
 from model import Music2PoseTransformer
+from pose_postprocess import ground_poses
 from train import BASELINE_CKPT
 
 # ── Constants (must match training) ──────────────────────────────────────────
@@ -112,7 +113,6 @@ def render_skeleton_video(poses_xyz: np.ndarray, title: str, tmp_path: str):
     """Render skeleton animation to a silent mp4 (720×1080)."""
     T = poses_xyz.shape[0]
 
-    # compute per-frame motion energy for the waveform bar
     vel    = np.diff(poses_xyz, axis=0)
     energy = np.concatenate([[0], np.linalg.norm(vel, axis=-1).mean(axis=-1)])
     energy = energy / (energy.max() + 1e-6)
@@ -130,14 +130,11 @@ def render_skeleton_video(poses_xyz: np.ndarray, title: str, tmp_path: str):
     ax.set_aspect("equal")
     ax.axis("off")
 
-    # title
     fig.text(0.5, 0.97, title, color="#e6edf3", fontsize=11,
              ha="center", va="top", fontweight="bold")
-    # bottom bar: time + energy
     bar_ax = fig.add_axes([0.05, 0.02, 0.90, 0.04])
     bar_ax.set_xlim(0, T); bar_ax.set_ylim(0, 1)
     bar_ax.axis("off")
-    progress_bg  = bar_ax.barh(0.5, T, height=0.8, color="#21262d", left=0)
     progress_bar = bar_ax.barh(0.5, 0, height=0.8, color="#3fb950", left=0)
     time_txt     = bar_ax.text(T * 0.5, 0.5, "0.0 s", color="white",
                                fontsize=7, ha="center", va="center")
@@ -154,7 +151,6 @@ def render_skeleton_video(poses_xyz: np.ndarray, title: str, tmp_path: str):
         kpts = poses_xyz[t]
         xs, ys = kpts[:,0], -kpts[:,1]
 
-        # color dots by segment
         cols = []
         for i in range(33):
             if i in FACE:  cols.append("#a0c4ff")
@@ -169,7 +165,6 @@ def render_skeleton_video(poses_xyz: np.ndarray, title: str, tmp_path: str):
             lines[idx].set_color(seg_color(a, b))
             lines[idx].set_alpha(0.85 + 0.15 * energy[t])
 
-        # progress bar
         progress_bar[0].set_width(t + 1)
         time_txt.set_text(f"{t / POSE_FPS:.1f} s / {T / POSE_FPS:.1f} s")
         return [scat, *lines, progress_bar[0], time_txt]
@@ -205,35 +200,48 @@ def main():
     parser.add_argument("--audio",      required=True,  help="Input audio file (any format)")
     parser.add_argument("--checkpoint", default=BASELINE_CKPT)
     parser.add_argument("--out",        default="outputs/dance.mp4")
+    parser.add_argument("--save_poses", default=None,
+                        help="Optional path to save predicted poses as .npy (T,33,3)")
+    parser.add_argument("--character_mesh", default=None,
+                        help="Optional GLB to animate with 3Dmodel/animate_character.py")
+    parser.add_argument("--character_out", default=None,
+                        help="Output MP4 for character render (default: <out> with _character)")
+    parser.add_argument("--ground", action="store_true",
+                        help="Plant lowest foot on a floor plane (post-process; prefer training fixes)")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
-    # 1. Audio
     print(f"\n[1/4] Loading audio: {args.audio}")
     waveform = load_audio(args.audio)
     duration = len(waveform) / AUDIO_SR
     print(f"  Duration: {duration:.1f}s  ({len(waveform)} samples @ {AUDIO_SR} Hz)")
 
     print("\n[2/4] Extracting audio features…")
-    audio_feat = audio_to_features(waveform)   # (T, 82)
+    audio_feat = audio_to_features(waveform)
     T = audio_feat.shape[0]
     print(f"  Feature shape: {audio_feat.shape}  ({T} frames @ {POSE_FPS} fps)")
 
-    # 2. Model
     print(f"\n[3/4] Loading model: {args.checkpoint}")
     model, ckpt = load_model(args.checkpoint, device)
     x_mean, x_std = ckpt["x_mean"], ckpt["x_std"]
     y_mean, y_std = ckpt["y_mean"], ckpt["y_std"]
 
-    # 3. Inference
     print(f"\n[4/4] Running inference ({T} frames)…")
     poses_xyz = run_inference(model, audio_feat, x_mean, x_std, y_mean, y_std, device)
     print(f"  Poses shape: {poses_xyz.shape}")
 
-    # 4. Render
+    if args.ground:
+        poses_xyz = ground_poses(poses_xyz)
+        print("  Grounding: planted lowest foot on median floor plane")
+
+    if args.save_poses:
+        os.makedirs(os.path.dirname(args.save_poses) or ".", exist_ok=True)
+        np.save(args.save_poses, poses_xyz.astype(np.float32))
+        print(f"  Saved poses: {args.save_poses}")
+
     title  = os.path.splitext(os.path.basename(args.audio))[0]
     tmp    = args.out.replace(".mp4", "_silent.mp4")
     print(f"\nRendering skeleton animation…")
@@ -243,6 +251,21 @@ def main():
     mux_audio(tmp, args.audio, args.out, duration)
     os.remove(tmp)
     print(f"\nDone! → {args.out}")
+
+    if args.character_mesh:
+        from pathlib import Path
+        char_out = args.character_out or args.out.replace(".mp4", "_character.mp4")
+        poses_path = args.save_poses or args.out.replace(".mp4", "_poses.npy")
+        if not args.save_poses:
+            np.save(poses_path, poses_xyz.astype(np.float32))
+        print(f"\nRendering character mesh → {char_out}")
+        subprocess.run([
+            sys.executable, "3Dmodel/animate_character.py",
+            "--poses", poses_path,
+            "--mesh", args.character_mesh,
+            "--audio", args.audio,
+            "--out", char_out,
+        ], check=False)
 
 
 if __name__ == "__main__":

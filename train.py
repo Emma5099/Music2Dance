@@ -3,16 +3,19 @@ train.py — Train Music2Pose on Colab or any cloud GPU.
 
 Loads directly from the HuggingFace dataset built by data/build_dataset.py.
 
-Quick start (Colab):
-  !pip install torch librosa numpy tqdm datasets soundfile
-  !python train.py --dataset_path dataset/
+Quick start (Colab) — dataset must live on local disk, not Drive:
+  !python data/prepare_colab.py --drive_root /content/drive/MyDrive/Code/Music2Dance
+  !python train.py --dataset_path /content/dataset \\
+      --resume /content/drive/MyDrive/Code/Music2Dance/checkpoints/epoch_120.pt \\
+      --ckpt_dir /content/drive/MyDrive/Code/Music2Dance/checkpoints --epochs 250
 
-Resume from the baseline checkpoint:
-  !python train.py --dataset_path dataset/ --resume checkpoints/epoch_180.pt --epochs 200
+Resume from a pre-wild baseline (prefer 120 or 180, not 190/195):
+  !python train.py --dataset_path dataset/ --resume checkpoints/epoch_120.pt --epochs 200
 
-Loss: weighted xyz + velocity/accel channels, temporal motion losses, beat alignment.
+Loss (v3): xyz + vel/accel channels, temporal motion, beat alignment,
+plus under-motion penalty and stance/leg-length priors (dynamic + stable).
 Training uses scheduled sampling and rolling 60-frame windows.
-Saves best.pt (lowest val), best_motion.pt (most motion), best_balanced.pt (sweet spot).
+Saves best.pt (lowest val) and best_motion.pt (highest motion%).
 
 Dataset format (per sample):
   pose_chunk  : (250, 33, 9)  — 10 s at 25 fps, xyz + Δxyz + Δ²xyz
@@ -36,10 +39,40 @@ from datasets import load_from_disk
 
 from model import Music2PoseTransformer
 
+try:
+    from data.prepare_colab import materialize_dataset, resolve_ckpt_dir
+except ImportError:
+    # Drive sync may lag behind train.py — keep training usable without prepare_colab.py
+    def resolve_ckpt_dir(resume, ckpt_dir):
+        if ckpt_dir:
+            return ckpt_dir
+        if resume:
+            parent = os.path.dirname(os.path.abspath(resume))
+            if parent:
+                return parent
+        return "checkpoints"
+
+    def materialize_dataset(dataset_path, drive_root=None):
+        path = os.path.abspath(dataset_path)
+        if "/content/drive/" in path.replace("\\", "/") and os.path.isdir("/content"):
+            local = "/content/dataset"
+            if os.path.isfile(os.path.join(local, "dataset_dict.json")):
+                print(f"Using local dataset cache: {local}")
+                return local
+            raise FileNotFoundError(
+                f"Dataset on Google Drive cannot be memory-mapped: {path}\n"
+                "Upload data/prepare_colab.py to Drive, then run:\n"
+                "  !python data/prepare_colab.py "
+                "--drive_root /content/drive/MyDrive/Code/Music2Dance\n"
+                "Or unzip dataset.zip to /content/dataset and pass "
+                "--dataset_path /content/dataset"
+            )
+        return path
+
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 DATASET_PATH = "dataset"
 CKPT_DIR       = "checkpoints"
-BASELINE_CKPT  = os.path.join(CKPT_DIR, "epoch_180.pt")
+BASELINE_CKPT  = os.path.join(CKPT_DIR, "pytorch_model.pt")
 BATCH_SIZE   = 16          # lower than before: mel extraction adds RAM
 EPOCHS       = int(os.environ.get("EPOCHS", 200))   # override via env for dry run
 LR           = 3e-4
@@ -66,27 +99,29 @@ POSE_ACCEL_SL = slice(198, 297)
 ONSET_FEAT_IDX = 80
 BEAT_FEAT_IDX  = 81
 
-# Loss weights — favour motion over static pose regression
-W_XYZ         = 1.0
-W_VEL_CH      = 0.3
-W_ACCEL_CH    = 0.3
-W_TEMP_VEL    = 1.0
-W_TEMP_ACCEL  = 0.5
-W_BEAT        = 0.2
+# Loss weights — favour dynamic motion; xyz alone collapses to a slow mean pose
+W_XYZ         = 0.6
+W_VEL_CH      = 0.4
+W_ACCEL_CH    = 0.4
+W_TEMP_VEL    = 1.5
+W_TEMP_ACCEL  = 0.8
+W_BEAT        = 0.5
+W_MOTION      = 1.0   # under-motion hinge (speed up slow predictions)
+W_STANCE      = 0.4   # foot-height + leg-length vs GT (stability / less "air sit")
+
+# MediaPipe foot / leg joints for stance priors (xyz layout: joint*3 + {0,1,2})
+_FOOT_JOINTS  = (27, 28, 29, 30, 31, 32)
+_LEG_BONES    = (
+    (23, 25), (25, 27), (27, 31),  # L hip-knee, knee-ankle, ankle-toe
+    (24, 26), (26, 28), (28, 32),  # R
+)
 
 # Scheduled sampling + rolling-context training (matches inference)
 CONTEXT_LEN    = 60
 SS_START       = 15
 SS_END         = 100
 SS_MAX         = 0.5
-CTX_TRAIN_PROB = 0.25
-
-# Balanced checkpoint — between static (ep 120 ~16%) and hyperactive (ep 85 ~91%)
-TARGET_MOTION_RATIO = 0.32   # aim for ~32% of GT motion
-MOTION_RATIO_LOW    = 0.18   # below this → mannequin penalty
-MOTION_RATIO_HIGH   = 0.60   # above this → too wild (ep 85 territory)
-W_BALANCED_MOTION   = 5.0    # weight of motion-band penalty vs val loss
-W_MOTION_TARGET     = 0.15   # soft training nudge toward TARGET_MOTION_RATIO
+CTX_TRAIN_PROB = 0.35   # more often train on inference-like short windows
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -221,29 +256,6 @@ def motion_ratio_batch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     return batch_motion_energy(pred) / (batch_motion_energy(target) + 1e-6)
 
 
-def motion_target_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Nudge batch motion ratio toward TARGET_MOTION_RATIO."""
-    ratio = motion_ratio_batch(pred, target)
-    return (ratio - TARGET_MOTION_RATIO).pow(2).mean()
-
-
-def motion_deviation_penalty(motion_ratio: float) -> float:
-    """
-    Penalty for being outside the sweet spot (linear — stronger signal than squared).
-    Low at TARGET_MOTION_RATIO, rises toward static or hyperactive extremes.
-    """
-    if motion_ratio < MOTION_RATIO_LOW:
-        return MOTION_RATIO_LOW - motion_ratio
-    if motion_ratio > MOTION_RATIO_HIGH:
-        return motion_ratio - MOTION_RATIO_HIGH
-    return abs(motion_ratio - TARGET_MOTION_RATIO)
-
-
-def balanced_score(val_loss: float, motion_ratio: float) -> float:
-    """Lower is better. Combines reconstruction quality with motion sweet spot."""
-    return val_loss + W_BALANCED_MOTION * motion_deviation_penalty(motion_ratio)
-
-
 def beat_alignment_loss(pred: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
     """
     Encourage predicted motion energy to correlate with onset + beat features.
@@ -273,6 +285,42 @@ def batch_motion_energy(pose: torch.Tensor) -> torch.Tensor:
     return vel.pow(2).sum(-1).sqrt().mean(dim=(1, 2))
 
 
+def _xyz33(pose: torch.Tensor) -> torch.Tensor:
+    return pose[..., POSE_XYZ_SL].view(pose.size(0), pose.size(1), 33, 3)
+
+
+def motion_underdrive_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Penalize predictions that move less than GT (asymmetric).
+    MSE on xyz alone prefers a slow average pose; this pushes energy back up.
+    """
+    ratio = motion_ratio_batch(pred, target)
+    return F.relu(1.0 - ratio).pow(2).mean()
+
+
+def stance_stability_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Keep feet / legs structured like GT in hip-centered space:
+      - supporting-foot height (max foot Y) per frame
+      - mean leg bone lengths (stops collapsed "sit in air" crouches)
+    """
+    xyz_p = _xyz33(pred)
+    xyz_t = _xyz33(target)
+
+    contact_p = xyz_p[:, :, _FOOT_JOINTS, 1].amax(dim=-1)
+    contact_t = xyz_t[:, :, _FOOT_JOINTS, 1].amax(dim=-1)
+    l_contact = F.mse_loss(contact_p, contact_t)
+
+    lengths_p = []
+    lengths_t = []
+    for a, b in _LEG_BONES:
+        lengths_p.append((xyz_p[:, :, a] - xyz_p[:, :, b]).norm(dim=-1))
+        lengths_t.append((xyz_t[:, :, a] - xyz_t[:, :, b]).norm(dim=-1))
+    l_bones = F.mse_loss(torch.stack(lengths_p, dim=-1), torch.stack(lengths_t, dim=-1))
+
+    return l_contact + l_bones
+
+
 def compute_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -284,12 +332,13 @@ def compute_loss(
     l_tvel  = temporal_velocity_loss(pred, target)
     l_tacc  = temporal_acceleration_loss(pred, target)
     l_beat  = beat_alignment_loss(pred, audio)
-    l_mtgt  = motion_target_loss(pred, target)
+    l_motion = motion_underdrive_loss(pred, target)
+    l_stance = stance_stability_loss(pred, target)
 
     loss = (
         W_XYZ * l_xyz + W_VEL_CH * l_vel + W_ACCEL_CH * l_acc
         + W_TEMP_VEL * l_tvel + W_TEMP_ACCEL * l_tacc + W_BEAT * l_beat
-        + W_MOTION_TARGET * l_mtgt
+        + W_MOTION * l_motion + W_STANCE * l_stance
     )
     motion_ratio = motion_ratio_batch(pred, target).mean().item()
     metrics = {
@@ -299,7 +348,8 @@ def compute_loss(
         "t_vel": l_tvel.item(),
         "t_acc": l_tacc.item(),
         "beat": l_beat.item(),
-        "motion_tgt": l_mtgt.item(),
+        "under": l_motion.item(),
+        "stance": l_stance.item(),
         "motion": batch_motion_energy(pred).mean().item(),
         "motion_ratio": motion_ratio,
     }
@@ -348,14 +398,17 @@ def train(
     dataset_path: str = DATASET_PATH,
     epochs: int = None,
     resume: str = None,
-    target_motion: float = TARGET_MOTION_RATIO,
+    ckpt_dir: str = None,
 ):
-    global TARGET_MOTION_RATIO
-    TARGET_MOTION_RATIO = target_motion
     n_epochs = epochs if epochs is not None else EPOCHS
-    os.makedirs(CKPT_DIR, exist_ok=True)
+    ckpt_dir = resolve_ckpt_dir(resume, ckpt_dir)
+    os.makedirs(ckpt_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Checkpoints → {ckpt_dir}")
+    print(
+        "Loss setup: v3 (xyz↓ + temporal↑ + beat↑ + under-motion + stance/legs)"
+    )
 
     resume_ckpt = None
     if resume:
@@ -365,12 +418,13 @@ def train(
         print(f"Resuming from {resume} (completed epoch {resume_ckpt['epoch']})")
 
     # ── Data ────────────────────────────────────────────────────────────────
+    dataset_path = materialize_dataset(dataset_path)
     dd = load_from_disk(dataset_path)
     train_hf = dd["train"]
     val_hf   = dd["validation"]
     print(f"Train: {len(train_hf)} chunks | Val: {len(val_hf)} chunks")
 
-    norm_cache = os.path.join(CKPT_DIR, "norm_stats.npz")
+    norm_cache = os.path.join(ckpt_dir, "norm_stats.npz")
     if resume_ckpt is not None:
         x_mean = resume_ckpt["x_mean"]
         x_std  = resume_ckpt["x_std"]
@@ -424,13 +478,11 @@ def train(
     start_epoch = 1
     best_val = float("inf")
     best_motion = 0.0
-    best_balanced = float("inf")
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model_state"])
         start_epoch = resume_ckpt["epoch"] + 1
         best_val = resume_ckpt.get("best_val", float("inf"))
         best_motion = resume_ckpt.get("best_motion", 0.0)
-        best_balanced = resume_ckpt.get("best_balanced", float("inf"))
         if start_epoch > n_epochs:
             print(f"Checkpoint already at epoch {resume_ckpt['epoch']} "
                   f"(>= --epochs {n_epochs}). Nothing to do.")
@@ -451,15 +503,11 @@ def train(
         optimizer, T_max=n_epochs, eta_min=LR * 0.01, last_epoch=last_epoch,
     )
 
-    print(f"Balanced target: {100 * TARGET_MOTION_RATIO:.0f}% motion  "
-          f"(band {100 * MOTION_RATIO_LOW:.0f}–{100 * MOTION_RATIO_HIGH:.0f}%)")
-
     if resume_ckpt is not None:
         best_str = f"{best_val:.4f}" if best_val != float("inf") else "unknown"
         motion_str = f"{100 * best_motion:.0f}%" if best_motion > 0 else "unknown"
-        bal_str = f"{best_balanced:.4f}" if best_balanced != float("inf") else "unknown"
         print(f"Continuing from epoch {start_epoch} → {n_epochs}  "
-              f"(best val: {best_str}, best motion: {motion_str}, best balanced: {bal_str})")
+              f"(best val: {best_str}, best motion: {motion_str})")
 
     for epoch in range(start_epoch, n_epochs + 1):
         # ── Train ────────────────────────────────────────────────────────────
@@ -509,10 +557,9 @@ def train(
         val_motion /= len(val_loader)
         val_motion_ratio /= len(val_loader)
 
-        epoch_balanced = balanced_score(val_loss, val_motion_ratio)
         ss_p = scheduled_sampling_prob(epoch)
         print(f"Epoch {epoch:03d}  train={train_loss:.4f}  val={val_loss:.4f}  "
-              f"motion%={100*val_motion_ratio:.1f}  balanced={epoch_balanced:.4f}  "
+              f"motion={val_motion:.4f}  motion%={100*val_motion_ratio:.1f}  "
               f"ss_p_gt={ss_p:.2f}  lr={scheduler.get_last_lr()[0]:.2e}")
 
         is_best = val_loss < best_val
@@ -522,10 +569,6 @@ def train(
         is_best_motion = val_motion_ratio > best_motion
         if is_best_motion:
             best_motion = val_motion_ratio
-
-        is_best_balanced = epoch_balanced < best_balanced
-        if is_best_balanced:
-            best_balanced = epoch_balanced
 
         # ── Save ─────────────────────────────────────────────────────────────
         ckpt = {
@@ -538,27 +581,21 @@ def train(
             "y_mean": y_mean, "y_std": y_std,
             "best_val": best_val,
             "best_motion": best_motion,
-            "best_balanced": best_balanced,
             "val_motion_ratio": val_motion_ratio,
-            "target_motion_ratio": TARGET_MOTION_RATIO,
             "config": model_cfg,
         }
         if is_best:
-            torch.save(ckpt, os.path.join(CKPT_DIR, "best.pt"))
+            torch.save(ckpt, os.path.join(ckpt_dir, "best.pt"))
 
         if is_best_motion:
-            torch.save(ckpt, os.path.join(CKPT_DIR, "best_motion.pt"))
-
-        if is_best_balanced:
-            torch.save(ckpt, os.path.join(CKPT_DIR, "best_balanced.pt"))
+            torch.save(ckpt, os.path.join(ckpt_dir, "best_motion.pt"))
 
         if epoch % SAVE_EVERY == 0:
-            torch.save(ckpt, os.path.join(CKPT_DIR, f"epoch_{epoch:03d}.pt"))
+            torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
 
-    print(f"\nDone. Best val: {best_val:.4f}  |  Best motion: {100*best_motion:.1f}%  "
-          f"|  Best balanced: {best_balanced:.4f}")
-    print(f"Checkpoints → {CKPT_DIR}/best_balanced.pt (recommended)  |  "
-          f"{CKPT_DIR}/best.pt  |  {CKPT_DIR}/best_motion.pt")
+    print(f"\nDone. Best val: {best_val:.4f}  |  Best motion: {100*best_motion:.1f}%")
+    print(f"Checkpoints → {ckpt_dir}/best.pt (lowest val)  |  "
+          f"{ckpt_dir}/best_motion.pt (most motion)")
 
 
 if __name__ == "__main__":
@@ -567,9 +604,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs (default: 200)")
     parser.add_argument("--resume", default=None,
-                        help="Path to .pt checkpoint to resume from (e.g. checkpoints/epoch_180.pt)")
-    parser.add_argument("--target_motion", type=float, default=TARGET_MOTION_RATIO,
-                        help="Target motion ratio for balanced checkpoint (default: 0.32 = 32%% of GT)")
+                        help="Path to .pt checkpoint to resume from (e.g. checkpoints/epoch_120.pt)")
+    parser.add_argument("--ckpt_dir", default=None,
+                        help="Where to write checkpoints (default: same folder as --resume)")
     args = parser.parse_args()
     train(args.dataset_path, epochs=args.epochs, resume=args.resume,
-          target_motion=args.target_motion)
+          ckpt_dir=args.ckpt_dir)

@@ -6,19 +6,22 @@ __pycache__/
 venv/
 .env
 
-# Data & artifacts (too large for git — download separately)
+# Data & artifacts (download separately)
 checkpoints/
 dataset/
 poses/
 videos/
 outputs/
 *.pt
-*.mp4
 *.wav
 *.npy
-
-# Logs
 *.log
+
+# Keep demo GIF and character mesh; ignore other media dumps
+*.mp4
+*.gif
+!assets/demo.gif
+!3Dmodel/character.glb
 
 # OS / IDE
 .DS_Store
