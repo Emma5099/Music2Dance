@@ -1,6 +1,6 @@
 # Music2Dance
 
-Generate dancing skeletons — and a 3D character — from any music track.
+Generate dancing a dancing 3D character from any music track.
 
 **Author:** [Emma Genthon](https://github.com/Emma5099) · genthonemma@gmail.com  
 **Weights:** [Emma5099/dance2music](https://huggingface.co/Emma5099/dance2music) (epoch 250)
